@@ -77,6 +77,9 @@ if not errorlevel 1 goto wait_to_finish";
             string ignore_process = "";
             string care_process = "";
             string no_inherit_process = "";
+            string pause_process = "";
+            string exclude_process = "";
+            string exclude_title = "";
             int debug_process = 0;
             bool fix_zorder = false;
             bool fix_zorder_specified = false;
@@ -158,6 +161,24 @@ if not errorlevel 1 goto wait_to_finish";
                 {
                     no_inherit_process = "";
                     pwp.SetNoinheritProcess(arg);
+                    continue;
+                }
+                else if (pause_process.Length > 0)
+                {
+                    pause_process = "";
+                    Rules.SetCommandLine(arg, null, null);
+                    continue;
+                }
+                else if (exclude_process.Length > 0)
+                {
+                    exclude_process = "";
+                    Rules.SetCommandLine(null, arg, null);
+                    continue;
+                }
+                else if (exclude_title.Length > 0)
+                {
+                    exclude_title = "";
+                    Rules.SetCommandLine(null, null, arg);
                     continue;
                 }
                 else if (hotkey == 1)
@@ -251,6 +272,15 @@ if not errorlevel 1 goto wait_to_finish";
                         break;
                     case "-no_inherit_process":
                         no_inherit_process = "_foo_";
+                        break;
+                    case "-pause_process":
+                        pause_process = "_foo_";
+                        break;
+                    case "-exclude_process":
+                        exclude_process = "_foo_";
+                        break;
+                    case "-exclude_title":
+                        exclude_title = "_foo_";
                         break;
                     case "-debug_process":
                         debug_process = 1;
@@ -401,6 +431,9 @@ if not errorlevel 1 goto wait_to_finish";
             Lang.Load(AppDomain.CurrentDomain.BaseDirectory);
             Lang.Load(appDataFolder);
 
+            // pause / exclusion lists
+            Rules.Load(appDataFolder);
+
             if (restore_snapshot >= 0)
             {
                 pwp.RestoreSnapshotCmd(restore_snapshot);
@@ -545,6 +578,8 @@ if not errorlevel 1 goto wait_to_finish";
                 systrayForm.notifyIconMain.Visible = false;
                 return;
             }
+
+            StartPauseWatch();
 
             if (splash)
             {
@@ -879,17 +914,121 @@ if not errorlevel 1 goto wait_to_finish";
             pwp.CenterWindow(PersistentWindowProcessor.GetForegroundWindow());
         }
 
+        // pause is requested either by the user (tray menu) or by a running process of
+        // the pause list (see Rules); capture and auto restore stay off while either holds
+        static bool manualPause = false;
+        static bool processPause = false;
+        static bool paused = false;
+        static readonly object pauseLock = new object();
+        static System.Threading.Timer pauseWatchTimer;
+        static int pauseWatchBusy = 0;
+        const int PauseWatchInterval = 3000; //in millisecond
+
+        /// <summary>name of the running process that currently forces the pause, null if none</summary>
+        public static string PauseProcessName = null;
+
         static public void PauseAutoRestore()
         {
-            pwp.pauseAutoRestore = true;
-            pwp.sessionActive = false; //disable capture as well
+            manualPause = true;
+            ApplyPause();
         }
 
         static public void ResumeAutoRestore()
         {
-            pwp.pauseAutoRestore = false;
-            pwp.restoringFromMem = true;
-            pwp.StartRestoreTimer();
+            manualPause = false;
+            ApplyPause();
+        }
+
+        static void ApplyPause()
+        {
+            lock (pauseLock)
+            {
+                bool want = manualPause || processPause;
+                if (want == paused)
+                    return;
+
+                paused = want;
+                if (want)
+                {
+                    pwp.pauseAutoRestore = true;
+                    pwp.sessionActive = false; //disable capture as well
+                }
+                else
+                {
+                    pwp.pauseAutoRestore = false;
+                    pwp.restoringFromMem = true;
+                    pwp.StartRestoreTimer();
+                }
+            }
+        }
+
+        static void StartPauseWatch()
+        {
+            pauseWatchTimer = new System.Threading.Timer(state => CheckPauseProcess());
+            pauseWatchTimer.Change(1000, PauseWatchInterval);
+        }
+
+        /// <summary>re-evaluate the pause list right away, e.g. after the lists were edited</summary>
+        static public void RulesChanged()
+        {
+            pauseWatchTimer?.Change(0, PauseWatchInterval);
+        }
+
+        static void CheckPauseProcess()
+        {
+            if (Interlocked.Exchange(ref pauseWatchBusy, 1) != 0)
+                return;
+
+            try
+            {
+                string name = Rules.FindRunningPauseProcess();
+                bool running = name != null;
+
+                // Resuming restores the layout and turns capture back on. Behind the lock screen
+                // that would record whatever Windows does to the windows there, so stay paused
+                // until the session is unlocked.
+                if (!running && processPause && pwp.SessionLocked)
+                    return;
+
+                if (running != processPause)
+                {
+                    if (running)
+                        Log.Event($"pause capture and auto restore, {name} is running");
+                    else
+                        Log.Event($"resume capture and auto restore, {PauseProcessName} exited");
+                }
+
+                bool changed = running != processPause || name != PauseProcessName;
+                processPause = running;
+                PauseProcessName = name;
+                ApplyPause();
+
+                // a manual snapshot/db restore finishing in the meantime turns capture back on
+                if (running && !pwp.restoringFromDB && !pwp.restoringSnapshot)
+                    pwp.sessionActive = false;
+
+                if (changed)
+                    UpdatePauseMenu();
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex.ToString());
+            }
+            finally
+            {
+                Interlocked.Exchange(ref pauseWatchBusy, 0);
+            }
+        }
+
+        static void UpdatePauseMenu()
+        {
+            if (systrayForm.contextMenuStripSysTray.InvokeRequired)
+                systrayForm.contextMenuStripSysTray.BeginInvoke((Action)delegate ()
+                {
+                    UpdatePauseMenu();
+                });
+            else
+                systrayForm.UpdatePauseMenu();
         }
 
         static void GetProcessInfo()
